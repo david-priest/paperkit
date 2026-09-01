@@ -2,34 +2,39 @@
 """paperfind — is this paper already on this machine?
 
 WHY THIS EXISTS
-    Paperpile stores your PDFs in Google Drive, so they are already on disk -- but there
-    is no way to search them from a terminal, and if Drive sync ever stalls you can end up
-    with several copies of the library in different states. Searching the wrong one makes
-    a paper you own look missing.
+    Reference managers sync your PDFs into a cloud drive, so they are already on disk --
+    but there is no way to search them from a terminal, and a script or AI agent has no
+    idea they exist. If sync ever stalls you can also end up with several copies of the
+    library in different states; searching the wrong one makes a paper you own look
+    missing.
 
-    Set PAPERKIT_STORES, or list your folders in ~/.config/paperkit/stores, or let
-    it auto-discover any "Paperpile/All Papers" directory under your home folder.
+    Configure it with PAPERKIT_STORES or ~/.config/paperkit/stores, or let it discover
+    any "Paperpile/All Papers" folder under your home directory.
 
 NAMING
-    Paperpile files PDFs as "<Surname> et al. <Year> - <Title>.pdf", by first letter of the
-    first author's surname, with long titles elided IN THE MIDDLE by " ... " -- so match on
-    surname and year, never a full title. Files renamed by other tools may carry no author
-    at all, so extra arguments are searched against the filename as title words.
+    Paperpile files PDFs as "<Surname> et al. <Year> - <Title>.pdf", by first letter of
+    the first author's surname, eliding long titles IN THE MIDDLE with " ... " -- so match
+    on surname and year, never a full title. Files renamed by other tools sometimes carry
+    no author at all, so extra arguments are searched against the filename as title words.
 
 USAGE
     paperfind Bannard 2013                    # surname + year
-    paperfind Shih 2002 BCR affinity          # extra words also search title-only filenames
+    paperfind Shih 2002 BCR affinity          # extra words narrow it, and can match
+                                              #   filenames that carry no author
     paperfind Kuraoka 2016 -o                 # open the top hit
-    paperfind Hagglof -m                      # no PDF? show the Paperpile metadata cache
+    paperfind Hagglof -m                      # no PDF? read the local metadata cache
     paperfind --selftest                      # regression suite
 
 WHY THE MATCHING IS FUSSY
-    Three real failures, all of which reported a paper as owned when it was not:
+    Every looser version reported a paper as owned when it was not:
       * a bare substring match returned "Long" for *long-lasting* and "Li" for *compared*
-      * the year was tested against the whole PATH, so the inbox folder "2025-06/" satisfied
+      * the year was tested against the whole PATH, so a folder named "2025-06/" satisfied
         a search for 2025 and returned a 2022 paper by the same author
-      * a preprint on disk under its bioRxiv year does not match the journal year, so
-        recent work looked missing when it was not -- hence the +/-1 year tolerance
+      * title words were used only as a fallback, never to filter surname hits, so
+        "Wang 2026 spatial proximity sequencing" returned an unrelated Wang 2026 paper
+      * multi-word surnames were not parsed: "de Carvalho 2023" searched for "de"
+      * a preprint filed under its bioRxiv year did not match the journal year, so recent
+        work looked missing -- hence +/-1 year tolerance, flagged "~year"
 
 EXIT
     0 hits found - 1 nothing found (then try -m, or paperget)
@@ -43,6 +48,11 @@ from pathlib import Path
 
 HOME = Path.home()
 REALM = HOME / "Library/Application Support/Paperpile/realm/paperpile.realm"
+AUTHORLESS = re.compile(r"^(19|20)\d{2}[,. ]")
+PARTICLES = {"de", "van", "von", "der", "den", "del", "di", "la", "le", "du"}
+STOP = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "role", "via",
+        "into", "non", "new", "novel", "vivo", "vitro"}
+
 
 def stores():
     """Where to look for PDFs, most authoritative first.
@@ -122,29 +132,74 @@ def year_ok(base, year):
     return d <= 1, d          # +/-1: a preprint on disk under its bioRxiv year
 
 
-def search(surname, year, words):
-    """(exact_hits, loose_hits). Loose = title-word match on a surname-less filename."""
+def parse_query(a):
+    """"Surname Year title words" -> (surname, year, words), handling multi-word surnames.
+
+    "de Carvalho 2023 clonal replacement" used to yield surname "de" -- which matched
+    "Ghoneim 2017 - De Novo Epigenetic..." -- and dropped the year entirely because
+    "Carvalho" is not a four-digit number. Same for "Manakkat Vijay 2026".
+    """
+    parts = list(a)
+    surname = parts.pop(0)
+    while parts:
+        nxt = parts[0]
+        low = surname.split()[-1].lower() in PARTICLES
+        # absorb a capitalised word if a year (or nothing) follows it: "Manakkat Vijay 2026"
+        two = (nxt[:1].isupper() and not re.fullmatch(r"(19|20)\d{2}", nxt)
+               and (len(parts) == 1 or re.fullmatch(r"(19|20)\d{2}", parts[1])))
+        if not (low or two):
+            break
+        surname += " " + parts.pop(0)
+    year = parts.pop(0) if parts and re.fullmatch(r"(19|20)\d{2}", parts[0]) else None
+    return surname, year, parts
+
+
+def title_overlap(base, words):
     keys = {fold(w) for w in words if len(w) > 3 and w.lower() not in STOP}
+    if not keys:
+        return None                      # nothing to judge on
+    fb = fold(base)
+    return sum(1 for k in keys if k in fb) / len(keys)
+
+
+def search(surname, year, words):
+    """(exact_hits, loose_hits). Title words FILTER surname hits as well as backfilling.
+
+    Using them only as a fallback meant a common surname plus a year returned the wrong
+    paper with full confidence: "Wang 2026 spatial proximity sequencing" produced
+    "Wang 2026, EBV infection HLA-DR15", and "Hagglof 2023 continuous germinal center"
+    produced the 2022 T-bet adipose paper.
+    """
     exact, loose = [], []
     for p in all_pdfs():
         b = p.name
         ok_y, dy = year_ok(b, year)
+        ov = title_overlap(b, words)
         if surname and surname_ok(b, surname) and ok_y:
-            exact.append((dy, p))
-        elif keys and ok_y:
-            fb = fold(b)
-            if sum(1 for k in keys if k in fb) / len(keys) >= 0.6:
-                loose.append((0, p))
+            if ov is None or ov >= 0.4:
+                exact.append((dy, -(ov or 0), p))
+        elif ov is not None and ov >= 0.8 and ok_y and AUTHORLESS.match(b):
+            # Title-only matching exists for ONE case: files another tool renamed without
+            # an author, e.g. "2002, Role BCR affinity T cell dependent.pdf". Allowing it
+            # on any filename made it answer "Wang 2026 spatial proximity sequencing" with
+            # "Cheng 2025, Sequencing-free whole-genome spatial transcriptomics" -- a
+            # different author's paper, presented with full confidence. The bar is high
+            # (0.8) because query words are often generic: "continuous germinal center"
+            # scored 0.67 against "2024, Germinal-center development memory B.pdf" on
+            # nothing but the two words every paper in this field shares.
+            loose.append((0, -ov, p))
     rank = {str(s): i for i, s in enumerate(stores())}
     def key(t):
-        return (t[0], next((i for s, i in rank.items() if str(t[1]).startswith(s)), 9))
-    return sorted(exact, key=key), sorted(loose, key=key)
+        return (t[0], t[1], next((i for s, i in rank.items()
+                                  if str(t[2]).startswith(s)), 9))
+    trim = lambda L: [(d, p) for d, _, p in sorted(L, key=key)]
+    return trim(exact), trim(loose)
 
 
 CASES = [
-    # (args, must_not_return_substring, must_return_substring). Fill these in for your own
-    # library -- every one of them was a real failure, and they are the reason the matching
-    # is fussy. Run: paperfind --selftest
+    # (args, must_not_return_substring, must_return_substring). Add cases for your own
+    # library -- every one in the private original was a real failure, and they are why
+    # the matching is fussy. Run: paperfind --selftest
     (["Zzzzqqq", "2020"], None, None),        # a nonsense query must return nothing
 ]
 
@@ -152,20 +207,20 @@ CASES = [
 def selftest():
     bad = 0
     for args, forbid, need in CASES:
-        sn = args[0]
-        yr = args[1] if len(args) > 1 and args[1].isdigit() else None
-        ex, lo = search(sn, yr, args[2:])
+        sn, yr, wd = parse_query(args)
+        ex, lo = search(sn, yr, wd)
         got = [str(p) for _, p in ex + lo]
-        ok = not (forbid and any(forbid in g for g in got))
+        joined = " | ".join(Path(g).name for g in got)
+        ok = True
+        if forbid and any(forbid in g for g in got):
+            ok = False
         if need and not any(need.lower() in g.lower() for g in got):
             ok = False
         if not need and not forbid and got:
             ok = False
         bad += not ok
-        print(f"  {'ok  ' if ok else 'FAIL'} {' '.join(args):<30} -> "
-              f"{' | '.join(Path(g).name for g in got)[:64] or '(none)'}")
-    print()
-    print(f"{len(CASES) - bad}/{len(CASES)} passed")
+        print(f"  {'ok  ' if ok else 'FAIL'} {' '.join(args):<34} -> {joined[:70] or '(none)'}")
+    print(f"\n{len(CASES) - bad}/{len(CASES)} passed")
     return 1 if bad else 0
 
 
@@ -179,10 +234,7 @@ def main():
     if not a:
         print(__doc__.split("USAGE")[1].split("WHY THE MATCHING")[0].rstrip())
         return 1
-    surname = a[0]
-    year = a[1] if len(a) > 1 and re.fullmatch(r"(19|20)\d{2}", a[1]) else None
-    words = a[2:] if year else a[1:]
-
+    surname, year, words = parse_query(a)
     exact, loose = search(surname, year, words)
     hits = exact or loose
     if hits:
