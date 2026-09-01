@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""papergap — find what a reading list systematically leaves out.
+
+WHY THIS EXISTS
+    Connected Papers, ResearchRabbit, Litmaps and Inciteful all draw citation graphs. None
+    of them know which papers you already own, which is the only thing that turns a graph
+    into a decision.
+
+        seed papers -> their reference lists -> rank by consensus -> check your library
+
+    A work cited by most of an expert-selected corpus is a landmark by consensus rather
+    than by anyone's guess. A landmark that is NOT in your library is the actual finding.
+
+HOW IT RESOLVES THINGS
+    Seeds come from PDFs (DOI scraped from the first pages, else the title), from a plain
+    list of DOIs/PMIDs/citations, or from a BibTeX file. Reference lists come from the
+    Semantic Scholar graph API as STRUCTURED records -- no regex over reference sections,
+    which is what made the first attempt count co-authors as separate works. Ownership comes from `paperfind`.
+
+USAGE
+    papergap --pdfs "<dir>"                    # every PDF in a folder is a seed
+    papergap --list refs.txt                   # one DOI / PMID / "Surname Year title" per line
+    papergap --bib library.bib                 # DOIs out of a BibTeX file
+    papergap --pdfs "<dir>" --min 5 --gaps     # only consensus works you do NOT own
+    papergap --list refs.txt --out report.md   # write a markdown table
+
+OPTIONS
+    --min N     minimum number of seeds that must cite a work (default: a third of them)
+    --gaps      show only works missing from the library
+    --top N     cap the output (default 60)
+    --out FILE  write markdown instead of a terminal table\n    --seeds F   dump the seed audit: identifier, how it resolved, matched title
+    --no-own    skip the paperfind check (faster, no ownership column)\n    --selftest  run the resolution regression suite
+
+NOTES
+    Unauthenticated Semantic Scholar allows ~100 requests per 5 min; this sleeps 1.1 s
+    between calls and one seed costs one call. Export S2_API_KEY to go faster.
+    Records with no DOI or no S2 entry are reported as unresolved rather than dropped.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+API = "https://api.semanticscholar.org/graph/v1"
+REF_FIELDS = "title,year,authors,citationCount,externalIds,venue"
+KEY = os.environ.get("S2_API_KEY")
+PAUSE = 0.4 if KEY else 1.1
+
+
+def s2(path, params):
+    url = f"{API}/{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "papergap/1.0"} |
+                                 ({"x-api-key": KEY} if KEY else {}))
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code in (429, 504) and attempt < 3:
+                time.sleep(4 * (attempt + 1))   # back off, the public tier is bursty
+                continue
+            return None
+    return None
+
+
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+CROSSREF = "https://api.crossref.org/works"
+CR_MAIL = os.environ.get("CROSSREF_MAILTO")     # opt-in polite pool; higher rate limits
+TITLE_STOP = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were",
+              "its", "role", "via", "during", "using", "into", "upon", "non", "new"}
+
+
+def http_json(url, tries=4):
+    req = urllib.request.Request(url, headers={"User-Agent": "papergap/1.0 (paperkit)"})
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:
+            if getattr(e, "code", None) in (429, 500, 502, 503, 504) and i < tries - 1:
+                time.sleep(3 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def words_of(text):
+    """Content words of a title, for match scoring."""
+    t = re.sub(r'\((19|20)\d{2}\)|\b(19|20)\d{2}\b', ' ', text or '')
+    w = {x.strip('.,:;()[]"').lower() for x in t.split()}
+    return {x for x in w if len(x) > 3 and x not in TITLE_STOP and not x.isdigit()}
+
+
+def title_hit(want, got):
+    """Fraction of the query's content words present in a candidate title."""
+    if not want:
+        return 0.0
+    g = (got or "").lower()
+    return sum(1 for w in want if w in g) / len(want)
+
+
+def title_of(raw):
+    """Pull the title out of a numbered reference line.
+
+    Verification must score against the TITLE, not the whole citation: an author surname
+    or journal name can never appear in a candidate title, so scoring the full string
+    rejected correct matches. Regex over the author run is too fragile -- it broke on
+    "A. Warren Navia", a two-word surname with no particle -- so walk comma-separated
+    segments instead and stop at the first one that does not look like an author.
+    """
+    t = re.sub(r'^\s*\d{1,3}\.\s*', '', raw).strip()
+    parts = t.split(', ')
+    i = 0
+    while i < len(parts) - 1 and re.search(r'\b[A-Z]\.', parts[i]) \
+            and len(parts[i].split()) <= 5:
+        i += 1
+    t = ', '.join(parts[i:])
+    m = re.match(r'^(.+?\.)\s+[A-Z]', t)          # cut at the journal
+    return (m.group(1) if m else t).rstrip('.').strip()
+
+
+def crossref_match(raw):
+    """Resolve a full reference STRING to a DOI.
+
+    Crossref's bibliographic query is built for exactly this and uses the journal, volume
+    and pages that a title-only search throws away -- which is why it succeeds on short
+    titles like "Germinal Centers" where a [Title] search returns hundreds of papers.
+    """
+    q = f"{CROSSREF}?rows=3&select=DOI,title,issued&query.bibliographic={urllib.parse.quote(raw[:400])}"
+    if CR_MAIL:
+        q += f"&mailto={urllib.parse.quote(CR_MAIL)}"
+    d = http_json(q)
+    time.sleep(1.0)
+    want = words_of(title_of(raw)) or words_of(raw)
+    yr = re.search(r'\((19|20)\d{2}\)|\b(19|20)\d{2}\b', raw)
+    yr = int(re.search(r'(19|20)\d{2}', yr.group(0)).group(0)) if yr else None
+    for it in ((d or {}).get("message") or {}).get("items", []):
+        title = (it.get("title") or [""])[0]
+        y = ((it.get("issued") or {}).get("date-parts") or [[None]])[0][0]
+        if yr and y and abs(y - yr) > 1:
+            continue
+        if title_hit(want, title) >= 0.55:
+            return it["DOI"], title, y
+    return None
+
+
+def pubmed_match(raw):
+    """Resolve to a PMID by [Title]-field search, verified against the returned title.
+
+    PubMed's first hit is not trustworthy on its own: "Germinal Centers" matched a paper
+    on the biophysical properties of IgD. A wrong seed contributes an entire unrelated
+    reference list to the ranking, so an unverifiable match must resolve to nothing.
+    """
+    tt = title_of(raw)
+    want = words_of(tt)
+    kw = [w for w in re.sub(r'[^A-Za-z0-9\- ]', ' ', tt).split()
+          if len(w) > 3 and w.lower() not in TITLE_STOP and not w.isdigit()]
+    if not kw:
+        return None
+    yr = re.search(r'\b(19|20)\d{2}\b', raw)
+    yr = int(yr.group(0)) if yr else None
+    for n in (6, 4, 3):
+        r = http_json(f"{EUTILS}/esearch.fcgi?db=pubmed&retmode=json&retmax=8&term=" +
+                      urllib.parse.quote(" AND ".join(f"{w}[Title]" for w in kw[:n])))
+        time.sleep(0.4)
+        ids = ((r or {}).get("esearchresult") or {}).get("idlist") or []
+        if not ids:
+            continue
+        d = (http_json(f"{EUTILS}/esummary.fcgi?db=pubmed&retmode=json&id=" +
+                       ",".join(ids)) or {}).get("result") or {}
+        time.sleep(0.4)
+        best, best_hit, best_t = None, 0.0, None
+        for pid in ids:
+            rec = d.get(pid) or {}
+            y = re.search(r"(19|20)\d{2}", rec.get("pubdate", "") or "")
+            if yr and y and abs(int(y.group(0)) - yr) > 1:
+                continue
+            h = title_hit(want, rec.get("title"))
+            if h > best_hit:
+                best, best_hit, best_t = pid, h, rec.get("title")
+        if best and best_hit >= 0.6:
+            return best, best_t
+    return None
+
+
+def seed_from_pdf(p):
+    """A modern PDF carries its own DOI in the first pages; else use the filename title."""
+    txt = subprocess.run(["pdftotext", "-f", "1", "-l", "3", str(p), "-"],
+                         capture_output=True, text=True).stdout
+    for m in re.finditer(r'\b(10\.\d{4,9}/[^\s"<>,;)\]]+)', txt):
+        doi = m.group(1).rstrip(".").rstrip(")")
+        if len(doi) > 12 and "figshare" not in doi:
+            return doi
+    stem = p.stem
+    m = re.search(r'[—–-]\s*(.+)$', stem)
+    return (m.group(1) if m and len(m.group(1)) > 15 else stem)[:150]
+
+
+def resolve(raw):
+    """A reference string -> {s2id, doi, pmid, title, via}. Identifier-anchored.
+
+    Order is most-reliable-first: an explicit DOI or PMID, then Crossref (which uses the
+    journal/volume/pages a title search discards), then a verified PubMed title search.
+    Every resolution carries the identifier it came from so the result is auditable.
+    """
+    raw = raw.strip()
+    out = {"s2id": None, "doi": None, "pmid": None, "title": None, "via": None}
+
+    m = re.search(r'\b(10\.\d{4,9}/[^\s"<>,;)\]]+)', raw)
+    if m:
+        out.update(doi=m.group(1).rstrip("."), via="doi-in-text")
+    elif re.fullmatch(r'\d{7,8}', raw):
+        out.update(pmid=raw, via="pmid-in-text")
+    else:
+        cr = crossref_match(raw)
+        if cr:
+            out.update(doi=cr[0], title=cr[1], via="crossref")
+        else:
+            pm = pubmed_match(raw)
+            if pm:
+                out.update(pmid=pm[0], title=pm[1], via="pubmed")
+    if not (out["doi"] or out["pmid"]):
+        return None
+
+    ident = f"DOI:{out['doi']}" if out["doi"] else f"PMID:{out['pmid']}"
+    r = s2(f"paper/{ident}", {"fields": "title,year,externalIds"})
+    time.sleep(PAUSE)
+    if r and r.get("paperId"):
+        out["s2id"] = r["paperId"]
+        out["title"] = r.get("title") or out["title"]
+        ext = r.get("externalIds") or {}
+        out["doi"] = out["doi"] or ext.get("DOI")
+        out["pmid"] = out["pmid"] or ext.get("PubMed")
+    return out
+
+
+def key_of(ref):
+    a = ref.get("authors") or []
+    sn = (a[0]["name"].split()[-1] if a else "?")
+    return f"{sn} {ref.get('year') or '?'}"
+
+
+def owned(surname, year):
+    try:
+        r = subprocess.run(["paperfind", surname] + ([str(year)] if year else []),
+                           capture_output=True, text=True, timeout=45)
+    except Exception:
+        return None
+    for line in r.stdout.splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
+CASES = [
+    # (raw reference line, expected PMID). Each was a real resolution failure.
+    ("1. \tG. D. Victora, M. C. Nussenzweig, Germinal Centers. Annu. Rev. Immunol. 40, "
+     "413-442 (2022).", "35113731"),
+    ("5. \tM. Gaya, P. Barral, A. Warren Navia, F. D. Batista, Initiation of Antiviral B "
+     "Cell Immunity Relies on Innate Signals from Spatially Positioned NKT Cells. Cell "
+     "172, 517-533 (2018).", "29249358"),
+    ("7. \tM. A. Linterman, L. Beaton, IL-21 acts directly on B cells to regulate Bcl-6 "
+     "expression and germinal center responses. J. Exp. Med. 207, 353-363 (2010).",
+     "20142429"),
+    # 1994, pre-DOI, wrong journal given in the test string on purpose: it must still
+    # resolve via PubMed rather than fall through to nothing.
+    ("9. \tR. J. Noelle, gp39-CD40 interactions are essential for germinal center "
+     "formation. J. Immunol. 152, 5643 (1994).", "7516405"),
+]
+
+
+def selftest():
+    bad = 0
+    for raw, want in CASES:
+        r = resolve(raw) or {}
+        got = r.get("pmid")
+        ok = (got == want) if want else True      # None = "must not return a wrong paper"
+        if want is None and got:
+            ok = False
+        bad += not ok
+        print(f"  {'ok  ' if ok else 'FAIL'} {title_of(raw)[:54]:<56} got={got} want={want}")
+    print(f"\n{len(CASES) - bad}/{len(CASES)} passed")
+    return 1 if bad else 0
+
+
+def main():
+    a = sys.argv[1:]
+    if "--selftest" in a:
+        return selftest()
+    def opt(flag, default=None):
+        return a[a.index(flag) + 1] if flag in a else default
+    gaps_only, do_own = "--gaps" in a, "--no-own" not in a
+    top, out = int(opt("--top", 60)), opt("--out")
+
+    seeds = []
+    if "--pdfs" in a:
+        seeds = [seed_from_pdf(p) for p in sorted(Path(opt("--pdfs")).glob("*.pdf"))]
+    elif "--list" in a:
+        # Pass the RAW reference line through. Crossref matches on journal, volume and
+        # pages as well as the title, so stripping it down to a title throws away the
+        # signal that resolves short titles like "Germinal Centers".
+        seeds = [l.strip() for l in Path(opt("--list")).read_text().splitlines()
+                 if l.strip() and not l.startswith("#")]
+    elif "--bib" in a:
+        for m in re.finditer(r'doi\s*=\s*[{"]([^}"]+)', Path(opt("--bib")).read_text(), re.I):
+            seeds.append(f"DOI:{m.group(1).strip()}")
+    else:
+        print(__doc__.split("USAGE")[1].split("NOTES")[0].rstrip())
+        return 1
+
+    print(f"resolving {len(seeds)} seeds…", file=sys.stderr)
+    cites, meta, resolved, unresolved, audit = defaultdict(set), {}, 0, [], []
+    for i, raw in enumerate(seeds, 1):
+        r0 = resolve(raw)
+        if not r0 or not r0.get("s2id"):
+            unresolved.append(raw)
+            ident = ""
+            if r0:                       # matched an id but Semantic Scholar has no record
+                ident = f"  [{r0.get('doi') or r0.get('pmid')} via {r0['via']}, not in S2]"
+            print(f"  [{i}/{len(seeds)}] UNRESOLVED  {raw[:56]}{ident}", file=sys.stderr)
+            continue
+        r = s2(f"paper/{r0['s2id']}/references", {"fields": REF_FIELDS, "limit": 1000})
+        time.sleep(PAUSE)
+        refs = [x["citedPaper"] for x in ((r or {}).get("data") or []) if x.get("citedPaper")]
+        resolved += 1
+        short = (r0.get("title") or raw)[:46]
+        tag = r0.get("pmid") or r0.get("doi") or "?"
+        audit.append((raw, tag, r0.get("via"), r0.get("title")))
+        print(f"  [{i}/{len(seeds)}] {len(refs):>4} refs  {short:<48} {r0['via']:<9} {tag}",
+              file=sys.stderr)
+        for ref in refs:
+            t = ref.get("title") or ""
+            # skip malformed records: no authors, or an abstract fragment scraped as a title
+            if not t or len(t) > 250 or not (ref.get("authors") or []):
+                continue
+            k = key_of(ref)
+            cites[k].add(i)          # seed index, not a title word
+            meta.setdefault(k, ref)
+
+    if opt("--seeds"):
+        Path(opt("--seeds")).write_text(
+            "\n".join(f"{t}\t{v}\t{ti}\t{raw[:120]}" for raw, t, v, ti in audit) + "\n")
+        print(f"seed audit -> {opt('--seeds')}", file=sys.stderr)
+    if not resolved:
+        print("no seeds resolved — check the input", file=sys.stderr)
+        return 1
+    thresh = int(opt("--min", max(2, resolved // 3 + 1)))
+
+    rows = []
+    for k, srcs in sorted(cites.items(),
+                          key=lambda kv: (-len(kv[1]), -(meta[kv[0]].get("citationCount") or 0))):
+        if len(srcs) < thresh:
+            continue
+        m = meta[k]
+        sn, yr = k.rsplit(" ", 1)
+        loc = owned(sn, yr if yr.isdigit() else None) if do_own else None
+        if gaps_only and loc:
+            continue
+        rows.append((len(srcs), k, m.get("title", ""), m.get("citationCount") or 0,
+                     (m.get("externalIds") or {}).get("DOI", ""), loc))
+        if len(rows) >= top:
+            break
+
+    hdr = (f"{resolved} seeds resolved, {len(cites)} distinct works cited, "
+           f"showing those cited by ≥{thresh}"
+           + (" and NOT in the library" if gaps_only else ""))
+    if out:
+        L = [f"# papergap\n", f"{hdr}\n",
+             "| seeds | work | cites | in library | title |", "|---|---|---|---|---|"]
+        for n, k, t, cc, doi, loc in rows:
+            own = "yes" if loc else "**no**"
+            L.append(f"| {n}/{resolved} | {k} | {cc} | {own} | {t[:110]} |")
+        if unresolved:
+            L += ["", "**Unresolved seeds:** " + "; ".join(str(u)[:60] for u in unresolved)]
+        Path(out).write_text("\n".join(L) + "\n")
+        print(f"wrote {out}", file=sys.stderr)
+    else:
+        print(f"\n{hdr}\n")
+        for n, k, t, cc, doi, loc in rows:
+            flag = "   " if loc else ">> "
+            print(f"{flag}{n:>2}/{resolved}  {k:<22} {cc:>6} cites  {t[:78]}")
+            if not loc and doi:
+                print(f"                                        https://doi.org/{doi}")
+        if unresolved:
+            print(f"\nunresolved seeds: {len(unresolved)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

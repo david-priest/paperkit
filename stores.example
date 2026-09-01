@@ -1,0 +1,6 @@
+# ~/.config/paperkit/stores — one PDF folder per line, most authoritative first.
+# '#' comments and ~ expansion are allowed. Delete this file to auto-discover instead.
+
+~/Google Drive/My Drive/Paperpile/All Papers
+~/Library/CloudStorage/GoogleDrive-you@example.com/My Drive/Paperpile/All Papers
+~/Downloads

@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""paperget — turn a list of citations into the fewest possible clicks to the PDFs.
+
+WHY THIS EXISTS
+    Publishers bot-wall direct downloads, and Paperpile's own fetch does not always
+    succeed. This never downloads anything: it checks your library first, resolves what
+    is missing to direct open-access URLs, and hands you one page of links.
+
+    The page leads with a single PubMed list containing exactly your papers. Paperpile's
+    Chrome extension renders its add-and-fetch button on every row of a results list, so
+    one tab gives one button per paper.
+
+USAGE
+    paperget "Long 2022" "Kuraoka 2016" "Stewart 2018"
+    paperget --page  "Hagglof 2023" "de Carvalho 2023"   # one page of buttons, opened
+    paperget --open  10.1038/s41586-025-08687-8          # straight to browser tabs
+    paperget --file citations.txt                        # one citation per line
+    echo "Tas 2016" | paperget -                         # stdin
+
+    A citation is a DOI, a PMID, or "Surname Year [extra words]".
+
+OPTIONS
+    --page    build an HTML index of every unowned paper and open it (best for >3)
+    --open    open a tab per paper, on PubMed where possible so the Paperpile\n              extension box is already showing — one click each, no navigation
+    --all     include papers already in the library instead of skipping them
+    --file F  read citations from a file, one per line ("-" for stdin)
+
+OPEN ACCESS
+    Unpaywall needs a contact email and is skipped unless UNPAYWALL_EMAIL is exported.
+    PMC and Europe PMC need nothing and already cover most biomedical work.
+
+EXIT
+    0 if every citation resolved to something clickable, 1 otherwise.
+"""
+import html
+import json
+import unicodedata
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+PARTICLES = {"de", "van", "von", "der", "den", "del", "di", "la", "le", "du"}
+UA = {"User-Agent": "paperget/1.0 (personal reference manager; contact via UNPAYWALL_EMAIL)"}
+OUT = Path(os.environ.get("PAPERGET_PAGE",
+           Path.home() / "Downloads" / "_paperget.html")).expanduser()
+
+
+def get(url, timeout=20):
+    try:
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf8", "replace")
+    except Exception:
+        return None
+
+
+def owned(citation):
+    """Ask paperfind, then CHECK THE TITLE before believing the answer.
+
+    This path had no verification at all: it passed surname+year to paperfind and returned
+    the first line. Two independent test agents hit the same wall on the same day --
+    "Singh 2026 BLIMP1 shapes germinal center..." came back OWNED pointing at
+    "Singh 2026, Dengue virus-specific memory B.pdf". The hard title gate the README
+    describes protected only the network resolver; the library path bypassed it entirely.
+    """
+    parts = citation.strip().split()
+    if not parts:
+        return None
+    year = next((p for p in parts if re.fullmatch(r"(19|20)\d{2}", p)), None)
+    rest = [p for p in parts[1:] if p != year]
+
+    # Try a one-word surname and a two-word one: "Manakkat Vijay 2026 ..." was reported
+    # missing because only parts[0] was ever used as the surname.
+    names = [parts[0]]
+    if len(parts) > 1 and parts[1][:1].isupper() and not re.fullmatch(r"(19|20)\d{2}", parts[1]):
+        names.append(f"{parts[0]} {parts[1]}")
+
+    keys = {w.lower().strip(".,:;()") for w in rest}
+    keys = {w for w in keys if len(w) > 3 and w not in TITLE_STOP and not w.isdigit()}
+    for name in names:
+        try:
+            r = subprocess.run(["paperfind", name] + ([year] if year else []) + rest,
+                               capture_output=True, text=True, timeout=90)
+        except Exception:
+            continue
+        for line in r.stdout.splitlines():
+            line = line.strip().replace("  ~year", "")
+            if not line:
+                continue
+            if not keys:
+                return line                    # no title given; nothing to verify against
+            base = fold(Path(line).name)
+            if sum(1 for k in keys if fold(k) in base) / len(keys) >= 0.5:
+                return line
+    return None
+
+
+def fold(x):
+    """Strip diacritics and case so Hagglof matches Hägglöf, Muller matches Müller."""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", x or "")
+                   if not unicodedata.combining(ch)).lower()
+
+
+TITLE_STOP = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "were",
+              "its", "role", "via", "during", "using", "into", "upon", "non", "new",
+              "novel", "vivo", "vitro", "human", "mouse", "cell", "cells"}
+
+
+def score(rec, surname, year, words):
+    """How well does a PubMed record match what was asked for? None = disqualified.
+
+    Surname and year identify nothing on their own. "Shih 2002" matches both the
+    BCR-affinity paper and an Optics Letters study of bismuth thin films that genuinely
+    has an author named Shih and a genuine 2002 date. Only the title separates them.
+    So: author and year are hard gates, the title decides, and the caller must be told
+    NOT FOUND rather than handed the wrong paper.
+    """
+    authors = rec.get("authors") or []
+    if not authors:
+        return None
+    want = fold(surname).split()[-1]
+    if not any(want in [t for t in fold(a).split() if len(t) > 2] for a in authors):
+        return None
+    if year:
+        if not rec.get("year") or abs(int(rec["year"]) - int(year)) > 1:
+            return None                      # asked for a year; must be able to confirm it
+
+    keys = {w.lower().strip(".,:;()") for w in words}
+    keys = {w for w in keys if len(w) > 3 and w not in TITLE_STOP and not w.isdigit()}
+    if not keys:
+        return 0.5                           # only a surname and year were given
+    got = fold(rec.get("title"))
+    return sum(1 for w in keys if fold(w) in got) / len(keys)
+
+
+def summaries(pmids):
+    """One esummary call for a batch of ids -> list of normalised records."""
+    if not pmids:
+        return []
+    j = get(f"{EUTILS}/esummary.fcgi?db=pubmed&retmode=json&id={','.join(pmids)}")
+    if not j:
+        return []
+    try:
+        res = json.loads(j)["result"]
+    except Exception:
+        return []
+    out = []
+    for pid in pmids:
+        d = res.get(pid)
+        if not d:
+            continue
+        m = re.search(r"(19|20)\d{2}", d.get("pubdate", "") or "")
+        rec = {"pmid": pid, "title": d.get("title"), "doi": None, "pmcid": None,
+               "authors": [a.get("name", "") for a in d.get("authors", [])],
+               "year": m.group(0) if m else None}
+        for a in d.get("articleids", []):
+            if a["idtype"] == "doi":
+                rec["doi"] = a["value"]
+            elif a["idtype"] == "pmc":
+                rec["pmcid"] = a["value"].replace("PMC", "")
+        out.append(rec)
+    return out
+
+
+def esearch(term, retmax=12):
+    j = get(f"{EUTILS}/esearch.fcgi?db=pubmed&retmode=json&retmax={retmax}&term={term}")
+    try:
+        return json.loads(j)["esearchresult"]["idlist"] if j else []
+    except Exception:
+        return []
+
+
+def resolve(citation):
+    """citation -> best-matching record. Accepts a DOI, a PMID, or "Surname Year words".
+
+    Considers up to a dozen candidates per query tier and returns the best scoring one,
+    instead of trusting whatever PubMed ranked first. Looking only at the top hit caused
+    both failure modes in one afternoon: a confidently wrong paper, and then -- after
+    tightening verification -- a NOT FOUND for a paper that was sitting at rank three.
+    """
+    blank = {"title": None, "doi": None, "pmid": None, "pmcid": None,
+             "authors": [], "year": None}
+    c = citation.strip()
+
+    if c.lower().startswith("10.") or "doi.org/" in c:
+        doi = c.split("doi.org/")[-1]
+        recs = summaries(esearch(urllib.parse.quote(f'"{doi}"[AID]'), 1))
+        return recs[0] if recs else dict(blank, doi=doi)
+    if re.fullmatch(r"\d{7,8}", c):
+        recs = summaries([c])
+        return recs[0] if recs else dict(blank, pmid=c)
+
+    parts = c.split()
+    surname = parts.pop(0)
+    # nobiliary particles lead the surname ("de Carvalho", "van der Meer"), so absorb the
+    # NEXT token while the last one we took is a particle. Testing the next token for
+    # lowercase instead left surname == "de".
+    while parts and surname.split()[-1].lower() in PARTICLES:
+        surname += " " + parts.pop(0)
+    year = next((p for p in parts if re.fullmatch(r"(19|20)\d{2}", p)), None)
+    rest = [p for p in parts if p != year]
+
+    # PubMed ANDs every term, so a long free-text query collapses to zero hits, while a
+    # bare surname+year returns a lottery (275 papers match "Shih 2002"). Field-tagged
+    # [Title] words give a small precise pool, so try those first and degrade from there.
+    base = f"{surname}[Author]" + (f" AND {year}[DP]" if year else "")
+    kw = [w.strip(".,:;()") for w in rest]
+    kw = [w for w in kw if len(w) > 3 and w.lower() not in TITLE_STOP and not w.isdigit()][:5]
+    tiers = []
+    if kw:
+        title_q = " AND ".join(f"{w}[Title]" for w in kw)
+        tiers += [f"{title_q} AND {surname}[Author]", title_q]
+    tiers += [base + (" AND " + " ".join(rest) if rest else ""), base]
+
+    best, best_score, n_ok = None, -1.0, 0
+    seen = set()
+    for t in dict.fromkeys(tiers):
+        ids = [i for i in esearch(urllib.parse.quote(t)) if i not in seen]
+        seen.update(ids)
+        for rec in summaries(ids):
+            s = score(rec, surname, year, rest)
+            if s is None:
+                continue
+            n_ok += 1
+            if s > best_score:
+                best, best_score = rec, s
+        if best_score >= 0.75:               # good enough; stop paying for more tiers
+            break
+
+    if best is not None and not kw and n_ok > 1:
+        best = dict(best, ambiguous=n_ok)     # no title given, several plausible matches
+    if best is None or best_score < 0.5:
+        hint = None
+        if seen:
+            first = summaries(list(seen)[:1])
+            hint = first[0]["title"] if first else None
+        return dict(blank, unverified=hint)
+    return best
+
+
+def pdf_url(meta):
+    """Best direct-PDF url, and how confident we are that a click will get a file."""
+    if meta["pmcid"]:
+        return f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{meta['pmcid']}/pdf/", "PMC"
+    doi = meta["doi"]
+    if doi:
+        if "biorxiv" in doi or "medrxiv" in doi:
+            return f"https://www.biorxiv.org/content/{doi}v1.full.pdf", "preprint"
+        email = os.environ.get("UNPAYWALL_EMAIL")
+        if email:
+            j = get(f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi)}"
+                    f"?email={urllib.parse.quote(email)}")
+            if j:
+                try:
+                    loc = json.loads(j).get("best_oa_location") or {}
+                    u = loc.get("url_for_pdf") or loc.get("url")
+                    if u:
+                        return u, "OA"
+                except Exception:
+                    pass
+        if meta["pmid"]:
+            return f"https://europepmc.org/article/MED/{meta['pmid']}", "EuropePMC"
+        return f"https://doi.org/{doi}", "publisher"
+    return None, None
+
+
+CASES = [
+    # (citation, expected PMID or None). Every one of these was a real failure:
+    #   Shih  -> a bismuth thin-films paper, genuinely 2002 with an author named Shih
+    #   de Carvalho -> only "de" was taken as the surname
+    #   Zzzzqqq -> must stay NOT FOUND; a confident wrong answer is the worst outcome
+    ("Shih 2002 role of BCR affinity in T cell dependent antibody responses in vivo", "12021782"),
+    ("de Carvalho 2023 clonal replacement long-lived germinal centers", "36565697"),
+    ("Zaheen 2009 AID constrains germinal center size", "19478044"),
+    ("Allen 2004 germinal center dark and light zone organization CXCR4 CXCR5", "15300245"),
+    ("Kuraoka 2016 complex antigens permissive clonal selection", "26948373"),
+    ("Bannard 2013 centroblasts transition centrocyte timed program", "24184055"),
+    ("10.1038/s41586-025-08687-8", "40108454"),
+    ("Zzzzqqq 2020", None),
+    # library path: a same-surname, same-year file with a different title must NOT be
+    # accepted as OWNED. Every earlier case exercised the resolver only, which is how
+    # the unverified owned() path stayed broken through eight green runs.
+    ("Singh 2026 BLIMP1 shapes germinal center B cell clonal diversity", "42010057"),
+]
+
+
+def selftest():
+    bad = 0
+    for cite, want in CASES:
+        got = resolve(cite).get("pmid")
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok  ' if ok else 'FAIL'} {cite[:60]:<62} got={got} want={want}")
+    print(f"\n{len(CASES) - bad}/{len(CASES)} passed")
+    return 1 if bad else 0
+
+
+def pubmed_list_url(rows):
+    """One PubMed results page holding exactly these papers.
+
+    Paperpile's extension puts a button on every row of a PubMed or Scholar results list,
+    so an OR-query over the PMIDs collapses N tabs into one page with N buttons.
+    """
+    ids = [r["pmid"] for r in rows if r.get("pmid")]
+    if not ids:
+        return None
+    return ("https://pubmed.ncbi.nlm.nih.gov/?term="
+            + urllib.parse.quote(" OR ".join(ids)))
+
+
+def main():
+    args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
+    page = "--page" in args
+    open_tabs = "--open" in args
+    show_all = "--all" in args
+    cites = []
+    if "--file" in args:
+        i = args.index("--file")
+        src = args[i + 1]
+        text = sys.stdin.read() if src == "-" else Path(src).read_text()
+        cites += [l.strip() for l in text.splitlines() if l.strip()]
+        del args[i:i + 2]
+    if "-" in args:
+        cites += [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
+    cites += [a for a in args if not a.startswith("-")]
+    if not cites:
+        print(__doc__.split("USAGE")[1].split("OPTIONS")[0].strip())
+        return 1
+
+    rows, missing = [], 0
+    for c in cites:
+        local = None if show_all else owned(c)
+        if local:
+            rows.append({"cite": c, "kind": "OWNED", "title":
+                         local.replace(str(Path.home()), "~")})
+            print(f"  OWNED      {c:<24} {Path(local).name[:64]}")
+            continue
+        meta = resolve(c)
+        url, kind = pdf_url(meta)
+        title = (meta["title"] or "").rstrip(".")[:110]
+        if url:
+            if meta.get("ambiguous"):
+                kind = "AMBIGUOUS"
+            rows.append({"cite": c, "kind": kind, "title": title, "pdf": url,
+                         "doi": meta["doi"], "pmid": meta["pmid"]})
+            print(f"  {kind:<10} {c:<24} {title[:78]}\n             {url}")
+            if meta.get("ambiguous"):
+                print(f"             ^ {meta['ambiguous']} papers match that author and "
+                      f"year — add title words to disambiguate")
+        else:
+            rows.append({"cite": c, "kind": "NOT FOUND", "title": title})
+            missing += 1
+            hint = meta.get("unverified")
+            print(f"  NOT FOUND  {c}"
+                  + (f"   (rejected a non-matching hit: {hint[:52]}...)" if hint else ""))
+
+    todo = [r for r in rows if r.get("pdf")]
+    if open_tabs:
+        # ONE PubMed results page containing exactly these papers, not a tab each.
+        # Paperpile's extension renders a button per result on list pages like PubMed
+        # and Google Scholar -- it has site-specific parsers for them, which is why it
+        # cannot do the same on this tool's own local page whatever markup we emit.
+        # So hand it a list page and every paper gets its own button in one tab.
+        u = pubmed_list_url(todo)
+        if u:
+            subprocess.run(["open", u])
+            n = sum(1 for r in todo if r.get("pmid"))
+            print(f"\n  opened one PubMed list with {n} paper{'s' if n != 1 else ''} — "
+                  f"a Paperpile button each")
+        for r in todo:                      # anything without a PMID still needs its own tab
+            if not r.get("pmid"):
+                subprocess.run(["open", r["pdf"]])
+
+    if page and todo:
+        # Paperpile's Chrome extension puts an "add + fetch PDF" box on PubMed, Google
+        # Scholar and publisher pages -- but NOT on a direct .pdf URL. So the first button
+        # is the PubMed abstract page: one click files the paper in the library and lets
+        # Paperpile try its own fetch. The direct PDF is the fallback when that misses.
+        def buttons(r):
+            b = []
+            if r.get("pmid"):
+                b.append(f'<a class="pp" href="https://pubmed.ncbi.nlm.nih.gov/'
+                         f'{r["pmid"]}/">Paperpile ▸ PubMed</a>')
+            q = urllib.parse.quote(r.get("title") or r["cite"])
+            b.append(f'<a class="sc" href="https://scholar.google.com/scholar?q={q}">'
+                     f'Scholar</a>')
+            b.append(f'<a class="pd" href="{html.escape(r["pdf"])}">'
+                     f'{html.escape(r["kind"])} PDF</a>')
+            if r.get("doi"):
+                b.append(f'<a class="d" href="https://doi.org/'
+                         f'{html.escape(r["doi"])}">doi</a>')
+            return "".join(b)
+
+        cards = "\n".join(
+            f'<li><div class="t">{html.escape(r.get("title") or r["cite"])}</div>'
+            f'<div class="c">{html.escape(r["cite"])}</div>'
+            f'<div class="r">{buttons(r)}</div></li>' for r in todo)
+
+        OUT.write_text(f"""<!doctype html><meta charset=utf8><title>paperget</title>
+<style>
+ :root{{--bg:#fff;--fg:#1a202c;--mute:#5b6675;--line:#e8ecf1;--chip:#f1f4f8}}
+ @media (prefers-color-scheme:dark){{
+   :root{{--bg:#12161c;--fg:#e6e9ee;--mute:#98a3b2;--line:#232a33;--chip:#1b2029}}}}
+ body{{font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+   margin:2.5rem auto;max-width:56rem;padding:0 1.2rem;background:var(--bg);color:var(--fg)}}
+ h1{{font-size:1.25rem;margin:0 0 .35rem}}
+ .lede{{color:var(--mute);margin:0 0 1.8rem}}
+ ol{{list-style:none;padding:0;counter-reset:n}}
+ li{{padding:.9rem 0 .95rem;border-bottom:1px solid var(--line);counter-increment:n}}
+ .t{{font-weight:600;margin-bottom:.15rem}}
+ .t::before{{content:counter(n) ". ";color:var(--mute);font-weight:400}}
+ .c{{color:var(--mute);font-size:.82rem;margin-bottom:.5rem}}
+ .r{{display:flex;flex-wrap:wrap;gap:.4rem}}
+ .r a{{text-decoration:none;font-size:.82rem;font-weight:600;padding:.3rem .6rem;
+   border-radius:5px;background:var(--chip);color:var(--mute);white-space:nowrap}}
+ .r a:hover{{filter:brightness(1.08)}}
+ .all{{display:inline-block;margin:.2rem 0 1.2rem;padding:.6rem 1rem;border-radius:7px;
+   background:#1f6f8b;color:#fff;font-weight:700;text-decoration:none;font-size:.95rem}}
+ .all:hover{{filter:brightness(1.08)}}
+ .pp{{background:#1f6f8b !important;color:#fff !important}}
+ .sc{{background:#e8eef7 !important;color:#2c4a72 !important}}
+ .pd{{background:#e3f2e8 !important;color:#1f6b3a !important}}
+ @media (prefers-color-scheme:dark){{
+   .sc{{background:#1d2b3d !important;color:#9dc0e8 !important}}
+   .pd{{background:#17301f !important;color:#7fc79a !important}}}}
+</style>
+<h1>{len(todo)} paper{'s' if len(todo)!=1 else ''} to fetch</h1>
+{f'<a class="all" href="{html.escape(pubmed_list_url(todo))}">Open all on one PubMed page — '
+ f'a Paperpile button per row</a>' if pubmed_list_url(todo) else ''}
+<p class=lede>That one link is usually all you need: Paperpile's extension puts its button on
+every row of a PubMed list, so you can add them all without leaving the page. The per-paper
+links below are for anything it misses — the green PDF saves to
+<code>your download folder</code>, where it is renamed and filed automatically.</p>
+<ol>{cards}</ol>""")
+        subprocess.run(["open", str(OUT)])
+        print(f"\n  page: {OUT}".replace(str(Path.home()), "~"))
+
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

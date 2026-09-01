@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""paperfind — is this paper already on this machine?
+
+WHY THIS EXISTS
+    Paperpile stores your PDFs in Google Drive, so they are already on disk -- but there
+    is no way to search them from a terminal, and if Drive sync ever stalls you can end up
+    with several copies of the library in different states. Searching the wrong one makes
+    a paper you own look missing.
+
+    Set PAPERKIT_STORES, or list your folders in ~/.config/paperkit/stores, or let
+    it auto-discover any "Paperpile/All Papers" directory under your home folder.
+
+NAMING
+    Paperpile files PDFs as "<Surname> et al. <Year> - <Title>.pdf", by first letter of the
+    first author's surname, with long titles elided IN THE MIDDLE by " ... " -- so match on
+    surname and year, never a full title. Files renamed by other tools may carry no author
+    at all, so extra arguments are searched against the filename as title words.
+
+USAGE
+    paperfind Bannard 2013                    # surname + year
+    paperfind Shih 2002 BCR affinity          # extra words also search title-only filenames
+    paperfind Kuraoka 2016 -o                 # open the top hit
+    paperfind Hagglof -m                      # no PDF? show the Paperpile metadata cache
+    paperfind --selftest                      # regression suite
+
+WHY THE MATCHING IS FUSSY
+    Three real failures, all of which reported a paper as owned when it was not:
+      * a bare substring match returned "Long" for *long-lasting* and "Li" for *compared*
+      * the year was tested against the whole PATH, so the inbox folder "2025-06/" satisfied
+        a search for 2025 and returned a 2022 paper by the same author
+      * a preprint on disk under its bioRxiv year does not match the journal year, so
+        recent work looked missing when it was not -- hence the +/-1 year tolerance
+
+EXIT
+    0 hits found - 1 nothing found (then try -m, or paperget)
+"""
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+HOME = Path.home()
+REALM = HOME / "Library/Application Support/Paperpile/realm/paperpile.realm"
+
+def stores():
+    """Where to look for PDFs, most authoritative first.
+
+    In order of precedence:
+      1. $PAPERKIT_STORES  -- colon-separated paths
+      2. ~/.config/paperkit/stores -- one path per line, '#' comments allowed
+      3. auto-discovery: any "Paperpile/All Papers" directory under $HOME, plus
+         ~/Downloads as a download inbox
+
+    Paperpile syncs PDFs into Google Drive, so the folder can be under "My Drive",
+    "Google Drive", "~/Library/CloudStorage/GoogleDrive-<account>", or a local copy
+    left behind after a sync problem. Auto-discovery finds all of them; list them
+    explicitly in the config file if you want to control the ranking.
+    """
+    env = os.environ.get("PAPERKIT_STORES")
+    if env:
+        return [Path(p).expanduser() for p in env.split(":") if p.strip()]
+    cfg = Path.home() / ".config/paperkit/stores"
+    if cfg.exists():
+        out = [Path(l.strip()).expanduser() for l in cfg.read_text().splitlines()
+               if l.strip() and not l.startswith("#")]
+        if out:
+            return out
+    found, home = [], Path.home()
+    for pat in ("*/Paperpile/All Papers", "*/*/Paperpile/All Papers",
+                "Library/CloudStorage/*/*/Paperpile/All Papers"):
+        found += sorted(home.glob(pat))
+    # biggest first: after a sync problem the live folder can be nearly empty while a
+    # stale local copy holds the real library
+    found.sort(key=lambda p: -sum(1 for _ in p.rglob("*.pdf")))
+    dl = home / "Downloads"
+    return found + ([dl] if dl.exists() else [])
+
+
+def inbox():
+    """Where a freshly downloaded PDF should be saved. Last store, or ~/Downloads."""
+    env = os.environ.get("PAPERKIT_INBOX")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / "Downloads"
+
+STOP = {"the", "and", "for", "with", "from", "that", "this", "are", "was", "role", "via",
+        "into", "non", "new", "novel", "vivo", "vitro"}
+
+
+def fold(x):
+    return "".join(c for c in unicodedata.normalize("NFKD", x or "")
+                   if not unicodedata.combining(c)).lower()
+
+
+def all_pdfs():
+    out = []
+    for st in stores():
+        if st.exists():
+            out += [p for p in st.rglob("*.pdf") if ".Trash" not in str(p)]
+    return out
+
+
+def surname_ok(base, surname):
+    """The surname must sit where a surname sits: at the start, or after '/' or '- '."""
+    return re.search(r"(^|[/(]|-\s|\band\s)" + re.escape(fold(surname)) +
+                     r"( et al\.?| and | \d{4}|,|\s)", fold(base)) is not None
+
+
+def year_ok(base, year):
+    """Year must appear in the BASENAME, not the path -- the inbox is foldered YYYY-MM,
+    so a path test let '2025-06/' satisfy a search for 2025 and return a 2022 paper."""
+    if not year:
+        return True, 0
+    yrs = [int(y) for y in re.findall(r"\b(19|20)\d{2}\b", base)] or \
+          [int(m.group(0)) for m in re.finditer(r"\b(?:19|20)\d{2}\b", base)]
+    yrs = [int(m.group(0)) for m in re.finditer(r"\b(?:19|20)\d{2}\b", base)]
+    if not yrs:
+        return False, 9
+    d = min(abs(y - int(year)) for y in yrs)
+    return d <= 1, d          # +/-1: a preprint on disk under its bioRxiv year
+
+
+def search(surname, year, words):
+    """(exact_hits, loose_hits). Loose = title-word match on a surname-less filename."""
+    keys = {fold(w) for w in words if len(w) > 3 and w.lower() not in STOP}
+    exact, loose = [], []
+    for p in all_pdfs():
+        b = p.name
+        ok_y, dy = year_ok(b, year)
+        if surname and surname_ok(b, surname) and ok_y:
+            exact.append((dy, p))
+        elif keys and ok_y:
+            fb = fold(b)
+            if sum(1 for k in keys if k in fb) / len(keys) >= 0.6:
+                loose.append((0, p))
+    rank = {str(s): i for i, s in enumerate(stores())}
+    def key(t):
+        return (t[0], next((i for s, i in rank.items() if str(t[1]).startswith(s)), 9))
+    return sorted(exact, key=key), sorted(loose, key=key)
+
+
+CASES = [
+    # (args, must_not_return_substring, must_return_substring). Fill these in for your own
+    # library -- every one of them was a real failure, and they are the reason the matching
+    # is fussy. Run: paperfind --selftest
+    (["Zzzzqqq", "2020"], None, None),        # a nonsense query must return nothing
+]
+
+
+def selftest():
+    bad = 0
+    for args, forbid, need in CASES:
+        sn = args[0]
+        yr = args[1] if len(args) > 1 and args[1].isdigit() else None
+        ex, lo = search(sn, yr, args[2:])
+        got = [str(p) for _, p in ex + lo]
+        ok = not (forbid and any(forbid in g for g in got))
+        if need and not any(need.lower() in g.lower() for g in got):
+            ok = False
+        if not need and not forbid and got:
+            ok = False
+        bad += not ok
+        print(f"  {'ok  ' if ok else 'FAIL'} {' '.join(args):<30} -> "
+              f"{' | '.join(Path(g).name for g in got)[:64] or '(none)'}")
+    print()
+    print(f"{len(CASES) - bad}/{len(CASES)} passed")
+    return 1 if bad else 0
+
+
+def main():
+    a = sys.argv[1:]
+    if "--selftest" in a:
+        return selftest()
+    op = "-o" in a or "--open" in a
+    meta = "-m" in a or "--meta" in a
+    a = [x for x in a if not x.startswith("-")]
+    if not a:
+        print(__doc__.split("USAGE")[1].split("WHY THE MATCHING")[0].rstrip())
+        return 1
+    surname = a[0]
+    year = a[1] if len(a) > 1 and re.fullmatch(r"(19|20)\d{2}", a[1]) else None
+    words = a[2:] if year else a[1:]
+
+    exact, loose = search(surname, year, words)
+    hits = exact or loose
+    if hits:
+        for dy, p in hits:
+            flag = "  ~year" if dy else ""
+            print(str(p).replace(str(HOME), "~") + flag)
+        if not exact:
+            print("  ^ matched on title words, not the surname "
+                  "(filed without an author)", file=sys.stderr)
+        if op:
+            subprocess.run(["open", str(hits[0][1])])
+        return 0
+
+    print(f"no PDF found for '{surname}'{(' ' + year) if year else ''}", file=sys.stderr)
+    if meta and REALM.exists():
+        print("--- Paperpile metadata cache ---", file=sys.stderr)
+        r = subprocess.run(["strings", "-n", "20", str(REALM)],
+                           capture_output=True, text=True)
+        seen = sorted({l for l in r.stdout.splitlines() if surname.lower() in l.lower()})
+        print("\n".join(seen[:20]))
+    else:
+        print(f"try: paperfind {surname}{(' ' + year) if year else ''} <title words>  "
+              f"or add -m to search the metadata cache", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
