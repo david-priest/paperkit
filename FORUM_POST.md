@@ -16,7 +16,7 @@ papergap --pdfs ./refs --gaps           # what is this reading list missing?
 
 **The workflow it enables.** Hand an agent a reading list. It runs `paperfind` on each, tells you which ones you actually lack, and `paperget` turns the remainder into a single page of links. You add them; the agent reads the ones you already had in full, rather than working from abstracts.
 
-**A trap worth knowing about even if you never install this.** My synced `Paperpile/` folder has only ~62 PDFs in it. After a sync problem last year, the real library was left behind as a stale local copy somewhere else. Anything searching the obvious location concludes a paper is missing when it is right there. If you have ever had a sync hiccup, it is worth checking whether you have more than one copy of your library in different states.
+**A trap worth knowing about even if you never install this.** Writing these tools is how I discovered my own library had been broken for three months. At some point the Paperpile folder was moved out of Google Drive, and Paperpile quietly created a fresh empty one four hours later — so the synced folder held 83 papers while the real 2,112 sat in a stale copy elsewhere on disk. Everything looked fine in the app. If you have ever moved that folder, or had a sync hiccup, it is worth counting what is actually in it.
 
 **The bit that surprised me.** I wanted a page of download links with a Paperpile button on each row. That does not work on a local HTML file — the extension only injects on sites it carries a parser for. But it works fine on a **PubMed results list**. So an OR-query over PMIDs gives you one tab, every paper you want, one Paperpile button each:
 
