@@ -90,6 +90,18 @@ Two things to know. **Counts are lower bounds**: Semantic Scholar's reference co
 
 Structured API records, not regex over reference sections — an earlier version counted every author of an entry as a separate work, so five co-authors of one paper appeared as five distinct "landmarks".
 
+## When Paperpile ships its API, most of this gets simpler
+
+Paperpile's roadmap lists a public REST API — "expose core functionality and enable automation, custom integrations, and deeper connections with external tools" — but it is not shipped, and there is no MCP server for Paperpile (nor for Zotero or Mendeley) in the connector registry. That absence is the reason `paperget` ends at a link rather than adding the reference itself: there is currently no programmatic way in, so the add step has to be a human clicking the extension.
+
+When that API lands, the shape of this changes rather than the purpose:
+
+- `paperget --add` would file references directly, and the PubMed-list page becomes a fallback for anything the API cannot fetch
+- `paperfind` would query the library rather than inferring it from filenames on disk, which removes the whole class of filename-parsing bugs documented above
+- `papergap` is unaffected — the citation-graph half does not depend on it
+
+Written against that expectation, so treat the link-and-click flow as a workaround with a known end date rather than the intended design.
+
 ## Licence
 
 MIT.
